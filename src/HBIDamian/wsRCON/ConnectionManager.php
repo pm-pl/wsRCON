@@ -7,9 +7,13 @@ class ConnectionManager {
     
     private const CONNECTION_TIMEOUT = 300;
     private const DEFAULT_MAX_CONNECTIONS = 10;
+    private const MAX_BUFFER_SIZE = 65536; // 64KB max buffer size
+    private const MAX_AUTH_ATTEMPTS = 5;
+    private const AUTH_LOCKOUT_TIME = 300; // 5 minutes lockout
     
     private Main $plugin;
     private array $connections = [];
+    private array $authAttempts = []; // Track authentication attempts by IP
     
     public function __construct(Main $plugin) {
         $this->plugin = $plugin;
@@ -99,10 +103,17 @@ class ConnectionManager {
         }
     }
     
-    public function appendToBuffer(int $connectionId, string $data): void {
+    public function appendToBuffer(int $connectionId, string $data): bool {
         if (isset($this->connections[$connectionId])) {
+            $newSize = strlen($this->connections[$connectionId]['buffer']) + strlen($data);
+            if ($newSize > self::MAX_BUFFER_SIZE) {
+                $this->plugin->debugLog("Buffer overflow attempt from connection: " . $connectionId . " (size: {$newSize} bytes)");
+                return false;
+            }
             $this->connections[$connectionId]['buffer'] .= $data;
+            return true;
         }
+        return false;
     }
     
     public function getBuffer(int $connectionId): string {
@@ -177,5 +188,79 @@ class ConnectionManager {
     
     public function isConnectionReadyForBroadcast(array $conn): bool {
         return $conn['handshake_done'] && $conn['authenticated'];
+    }
+    
+    /**
+     * Get the IP address for a connection
+     */
+    public function getConnectionIP(int $connectionId): string {
+        if (!isset($this->connections[$connectionId])) {
+            return 'unknown';
+        }
+        $peerName = $this->plugin->getWebSocketServer()->getSocketPeerName($this->connections[$connectionId]['socket']);
+        $parts = explode(':', $peerName);
+        return $parts[0] ?? 'unknown';
+    }
+    
+    /**
+     * Check if a connection can attempt authentication (rate limiting)
+     */
+    public function canAttemptAuth(int $connectionId): bool {
+        $ip = $this->getConnectionIP($connectionId);
+        
+        if (!isset($this->authAttempts[$ip])) {
+            return true;
+        }
+        
+        // Check if lockout period has expired
+        if (time() < $this->authAttempts[$ip]['lockout_until']) {
+            $remaining = $this->authAttempts[$ip]['lockout_until'] - time();
+            $this->plugin->debugLog("IP {$ip} is locked out for {$remaining} more seconds");
+            return false;
+        }
+        
+        // Reset if lockout expired
+        if ($this->authAttempts[$ip]['lockout_until'] > 0 && time() >= $this->authAttempts[$ip]['lockout_until']) {
+            unset($this->authAttempts[$ip]);
+        }
+        
+        return true;
+    }
+    
+    /**
+     * Record an authentication attempt for rate limiting
+     */
+    public function recordAuthAttempt(int $connectionId, bool $success): void {
+        $ip = $this->getConnectionIP($connectionId);
+        
+        if ($success) {
+            // Clear attempts on successful auth
+            unset($this->authAttempts[$ip]);
+            return;
+        }
+        
+        if (!isset($this->authAttempts[$ip])) {
+            $this->authAttempts[$ip] = ['count' => 0, 'lockout_until' => 0];
+        }
+        
+        $this->authAttempts[$ip]['count']++;
+        $this->plugin->debugLog("Failed auth attempt #{$this->authAttempts[$ip]['count']} from IP: {$ip}");
+        
+        if ($this->authAttempts[$ip]['count'] >= self::MAX_AUTH_ATTEMPTS) {
+            $this->authAttempts[$ip]['lockout_until'] = time() + self::AUTH_LOCKOUT_TIME;
+            $this->plugin->getLogger()->warning("IP {$ip} locked out for " . self::AUTH_LOCKOUT_TIME . " seconds due to too many failed auth attempts");
+        }
+    }
+    
+    /**
+     * Clean up expired auth attempt records
+     */
+    public function cleanupAuthAttempts(): void {
+        $now = time();
+        foreach ($this->authAttempts as $ip => $data) {
+            if ($data['lockout_until'] > 0 && $now >= $data['lockout_until']) {
+                unset($this->authAttempts[$ip]);
+            }
+        }
     }
 }

@@ -6,7 +6,7 @@ namespace HBIDamian\wsRCON;
 class SocketUtils {
     
     public static function isValidSocket(mixed $socket): bool {
-        return is_resource($socket) || (is_object($socket) && get_class($socket) === 'Socket');
+        return is_resource($socket) || ($socket instanceof \Socket);
     }
     
     public static function getSocketPeerName(mixed $socket): string {
