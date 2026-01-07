@@ -8,6 +8,8 @@ use pocketmine\utils\TextFormat;
 
 class MessageHandler {
     
+    private const MAX_COMMAND_LENGTH = 1000;
+    
     private Main $plugin;
     private FrameHandler $frameHandler;
     
@@ -59,11 +61,21 @@ class MessageHandler {
             return;
         }
         
-        if ($providedPassword === $configPassword) {
+        // Check rate limiting
+        if (!$this->plugin->getConnectionManager()->canAttemptAuth($connectionId)) {
+            $this->frameHandler->sendMessage($socket, "Too many failed attempts. Please wait before trying again.");
+            $this->plugin->getLogger()->warning("Rate limited authentication attempt from: " . $connectionId);
+            return;
+        }
+        
+        // Use hash_equals to prevent timing attacks
+        if (hash_equals($configPassword, $providedPassword)) {
             $this->plugin->getConnectionManager()->setAuthenticated($connectionId, true);
+            $this->plugin->getConnectionManager()->recordAuthAttempt($connectionId, true);
             $this->frameHandler->sendMessage($socket, "Authentication successful! Console access granted.");
             $this->plugin->getLogger()->info("WebSocket client authenticated: " . $connectionId);
         } else {
+            $this->plugin->getConnectionManager()->recordAuthAttempt($connectionId, false);
             $this->frameHandler->sendMessage($socket, "Authentication failed - incorrect password.");
             $this->plugin->getLogger()->warning("WebSocket authentication failed for client: " . $connectionId);
         }
@@ -75,14 +87,23 @@ class MessageHandler {
             $providedPassword = $messageData['password'] ?? '';
             $configPassword = $this->plugin->getConfig()->get('websocket-password', '');
             
-            if (!empty($configPassword) && $providedPassword !== $configPassword) {
+            // Check rate limiting
+            if (!$this->plugin->getConnectionManager()->canAttemptAuth($connectionId)) {
+                $this->frameHandler->sendMessage($socket, "Too many failed attempts. Please wait before trying again.");
+                return;
+            }
+            
+            // Use hash_equals to prevent timing attacks
+            if (!empty($configPassword) && !hash_equals($configPassword, $providedPassword)) {
+                $this->plugin->getConnectionManager()->recordAuthAttempt($connectionId, false);
                 $this->frameHandler->sendMessage($socket, "Authentication required or password incorrect.");
                 return;
             }
             
             // Auto-authenticate if password matches
-            if (!empty($configPassword) && $providedPassword === $configPassword) {
+            if (!empty($configPassword) && hash_equals($configPassword, $providedPassword)) {
                 $this->plugin->getConnectionManager()->setAuthenticated($connectionId, true);
+                $this->plugin->getConnectionManager()->recordAuthAttempt($connectionId, true);
                 $this->frameHandler->sendMessage($socket, "Auto-authenticated with command.");
             }
         }
@@ -94,6 +115,20 @@ class MessageHandler {
     }
     
     public function handleCommand(string $command, mixed $socket): void {
+        // Validate command length
+        if (strlen($command) > self::MAX_COMMAND_LENGTH) {
+            $this->frameHandler->sendMessage($socket, "Command too long (max " . self::MAX_COMMAND_LENGTH . " characters)");
+            $this->plugin->debugLog("Rejected command - too long: " . strlen($command) . " chars");
+            return;
+        }
+        
+        // Sanitize command - remove control characters except spaces
+        $command = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '', $command);
+        
+        if (empty(trim($command))) {
+            return;
+        }
+        
         $this->plugin->getLogger()->info("WebSocket command: " . $command);
         
         // Broadcast the command being executed to all clients
@@ -115,14 +150,14 @@ class MessageHandler {
                         'type' => 'response',
                         'message' => "Unknown command: " . $command,
                         'timestamp' => date('H:i:s')
-                    ]);
+                    ], JSON_THROW_ON_ERROR);
                     $this->frameHandler->sendMessage($socket, $errorResponse);
                     
                     $helpResponse = json_encode([
                         'type' => 'response', 
                         'message' => "Type 'help' to see available commands.",
                         'timestamp' => date('H:i:s')
-                    ]);
+                    ], JSON_THROW_ON_ERROR);
                     $this->frameHandler->sendMessage($socket, $helpResponse);
                 }
             }),
@@ -159,23 +194,30 @@ class MessageHandler {
     }
     
     public function broadcast(string $message): void {
-        $authenticatedCount = 0;
-        $totalConnections = $this->plugin->getConnectionManager()->getConnectionCount();
+        $connections = $this->plugin->getConnectionManager()->getAllConnections();
+        if (empty($connections)) {
+            return;
+        }
         
         $cleanMessage = TextFormat::clean($message);
         $jsonMessage = json_encode([
             'type' => 'console',
             'message' => $cleanMessage,
             'timestamp' => date('H:i:s')
-        ]);
+        ], JSON_THROW_ON_ERROR);
+        
+        // Pre-encode frame once for all connections (optimization)
+        $frame = $this->frameHandler->encodeFrame($jsonMessage);
         
         $this->plugin->getConnectionManager()->debugConnectionStatus();
         
-        foreach ($this->plugin->getConnectionManager()->getAllConnections() as $id => $conn) {
+        $authenticatedCount = 0;
+        foreach ($connections as $id => $conn) {
             if ($this->plugin->getConnectionManager()->isConnectionReadyForBroadcast($conn)) {
                 $socketType = SocketUtils::getSocketType($conn['socket']);
                 $this->plugin->debugLog("  Sending to client {$id}: socket type = {$socketType}");
-                $this->frameHandler->sendMessage($conn['socket'], $jsonMessage);
+                // Send pre-encoded frame directly
+                @socket_write($conn['socket'], $frame);
                 $authenticatedCount++;
             }
         }
@@ -188,7 +230,10 @@ class MessageHandler {
     }
     
     public function broadcastConsoleOutput(string $message, string $level = 'INFO'): void {
-        $authenticatedCount = 0;
+        $connections = $this->plugin->getConnectionManager()->getAllConnections();
+        if (empty($connections)) {
+            return;
+        }
         
         $cleanMessage = TextFormat::clean($message);
         $jsonMessage = json_encode([
@@ -196,11 +241,15 @@ class MessageHandler {
             'message' => $cleanMessage,
             'timestamp' => date('H:i:s'),
             'level' => $level
-        ]);
+        ], JSON_THROW_ON_ERROR);
         
-        foreach ($this->plugin->getConnectionManager()->getAllConnections() as $conn) {
+        // Pre-encode frame once for all connections (optimization)
+        $frame = $this->frameHandler->encodeFrame($jsonMessage);
+        
+        $authenticatedCount = 0;
+        foreach ($connections as $conn) {
             if ($this->plugin->getConnectionManager()->isConnectionReadyForBroadcast($conn)) {
-                $this->frameHandler->sendMessage($conn['socket'], $jsonMessage);
+                @socket_write($conn['socket'], $frame);
                 $authenticatedCount++;
             }
         }

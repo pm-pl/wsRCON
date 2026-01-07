@@ -294,6 +294,17 @@ class WebSocketServer {
     }
     
     private function handleNewConnections(): void {
+        // Check connection limit before accepting
+        if (!$this->plugin->getConnectionManager()->canAcceptNewConnection()) {
+            $this->plugin->debugLog("Max connections reached (" . $this->plugin->getConnectionManager()->getMaxConnections() . "), rejecting new connection");
+            // Accept and immediately close to prevent hanging connection
+            $newSocket = $this->acceptNewConnection();
+            if ($newSocket !== false) {
+                @socket_close($newSocket);
+            }
+            return;
+        }
+        
         $newSocket = $this->acceptNewConnection();
         if ($newSocket !== false) {
             $connectionId = $this->plugin->getConnectionManager()->addConnection($newSocket);
@@ -308,7 +319,12 @@ class WebSocketServer {
                 continue;
             }
 
-            $this->plugin->getConnectionManager()->appendToBuffer($id, $data);
+            // Check buffer overflow
+            if (!$this->plugin->getConnectionManager()->appendToBuffer($id, $data)) {
+                $this->plugin->getLogger()->warning("Connection {$id} exceeded buffer limit, disconnecting");
+                $this->plugin->getConnectionManager()->removeConnection($id);
+                continue;
+            }
             $this->plugin->getConnectionManager()->updateLastActivity($id);
             
             $buffer = $this->plugin->getConnectionManager()->getBuffer($id);
@@ -336,11 +352,27 @@ class WebSocketServer {
     
     private function processWebSocketFrames(int $connectionId, mixed $socket): void {
         $buffer = $this->plugin->getConnectionManager()->getBuffer($connectionId);
+        $frameHandler = $this->plugin->getFrameHandler();
         
         while (strlen($buffer) > 0) {
-            $message = $this->plugin->getFrameHandler()->decodeFrame($buffer);
+            $message = $frameHandler->decodeFrame($buffer);
             if ($message === null) {
                 break;
+            }
+            
+            // Handle close frame
+            if ($frameHandler->isCloseMarker($message)) {
+                $this->plugin->debugLog("Client {$connectionId} sent close frame, closing connection");
+                $frameHandler->sendClose($socket, 1000, "Goodbye");
+                $this->plugin->getConnectionManager()->removeConnection($connectionId);
+                return;
+            }
+            
+            // Handle ping frame - respond with pong
+            if ($frameHandler->isPingMarker($message)) {
+                $payload = $frameHandler->getPingPayload($message);
+                $frameHandler->sendPong($socket, $payload);
+                continue;
             }
             
             $this->plugin->getMessageHandler()->handleWebSocketMessage(trim($message), $socket, $connectionId);

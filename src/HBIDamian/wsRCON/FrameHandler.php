@@ -11,6 +11,18 @@ class FrameHandler {
         $this->plugin = $plugin;
     }
     
+    // WebSocket opcodes
+    private const OPCODE_CONTINUATION = 0;
+    private const OPCODE_TEXT = 1;
+    private const OPCODE_BINARY = 2;
+    private const OPCODE_CLOSE = 8;
+    private const OPCODE_PING = 9;
+    private const OPCODE_PONG = 10;
+    
+    // Special markers for control frames
+    public const MARKER_CLOSE = "\x00__CLOSE__\x00";
+    public const MARKER_PING = "\x00__PING__\x00";
+    
     public function decodeFrame(string &$data): ?string {
         if (strlen($data) < 2) return null;
         
@@ -20,14 +32,6 @@ class FrameHandler {
         $opcode = $firstByte & 0x0F;
         $masked = ($secondByte >> 7) & 1;
         $payloadLen = $secondByte & 0x7F;
-        
-        // Only handle text frames
-        if ($opcode !== 1) {
-            // Remove this frame from buffer even if we don't process it
-            $this->plugin->debugLog("Received non-text frame with opcode: " . $opcode);
-            $data = '';
-            return null;
-        }
         
         $offset = 2;
         
@@ -60,9 +64,36 @@ class FrameHandler {
         // Remove processed frame from buffer
         $data = substr($data, $offset + $payloadLen);
         
-        $this->plugin->debugLog("Decoded WebSocket frame: " . substr($payload, 0, 100));
-        
-        return $payload;
+        // Handle different opcodes
+        switch ($opcode) {
+            case self::OPCODE_TEXT:
+                $this->plugin->debugLog("Decoded WebSocket text frame: " . substr($payload, 0, 100));
+                return $payload;
+                
+            case self::OPCODE_CLOSE:
+                $this->plugin->debugLog("Received WebSocket close frame");
+                return self::MARKER_CLOSE;
+                
+            case self::OPCODE_PING:
+                $this->plugin->debugLog("Received WebSocket ping frame");
+                return self::MARKER_PING . $payload;
+                
+            case self::OPCODE_PONG:
+                $this->plugin->debugLog("Received WebSocket pong frame");
+                return null; // Ignore pong frames
+                
+            case self::OPCODE_BINARY:
+                $this->plugin->debugLog("Received binary frame (not supported), ignoring");
+                return null;
+                
+            case self::OPCODE_CONTINUATION:
+                $this->plugin->debugLog("Received continuation frame (not supported), ignoring");
+                return null;
+                
+            default:
+                $this->plugin->debugLog("Received unknown opcode: " . $opcode);
+                return null;
+        }
     }
     
     public function encodeFrame(string $message): string {
@@ -101,5 +132,73 @@ class FrameHandler {
             return;
         }
         @socket_write($socket, $message);
+    }
+    
+    /**
+     * Send a pong frame in response to a ping
+     */
+    public function sendPong(mixed $socket, string $payload = ''): void {
+        if (!SocketUtils::isValidSocket($socket)) {
+            return;
+        }
+        
+        $length = strlen($payload);
+        $frame = chr(0x8A); // Pong frame with FIN bit (0x80 | 0x0A)
+        
+        if ($length < 126) {
+            $frame .= chr($length);
+        } elseif ($length < 65536) {
+            $frame .= chr(126) . pack('n', $length);
+        } else {
+            $frame .= chr(127) . pack('J', $length);
+        }
+        
+        $frame .= $payload;
+        @socket_write($socket, $frame);
+        $this->plugin->debugLog("Sent pong frame");
+    }
+    
+    /**
+     * Send a close frame
+     */
+    public function sendClose(mixed $socket, int $code = 1000, string $reason = ''): void {
+        if (!SocketUtils::isValidSocket($socket)) {
+            return;
+        }
+        
+        $payload = pack('n', $code) . $reason;
+        $length = strlen($payload);
+        $frame = chr(0x88); // Close frame with FIN bit (0x80 | 0x08)
+        
+        if ($length < 126) {
+            $frame .= chr($length);
+        } else {
+            $frame .= chr(126) . pack('n', $length);
+        }
+        
+        $frame .= $payload;
+        @socket_write($socket, $frame);
+        $this->plugin->debugLog("Sent close frame with code: " . $code);
+    }
+    
+    /**
+     * Check if message is a control frame marker
+     */
+    public function isCloseMarker(?string $message): bool {
+        return $message === self::MARKER_CLOSE;
+    }
+    
+    /**
+     * Check if message is a ping marker and extract payload
+     */
+    public function isPingMarker(?string $message): bool {
+        return $message !== null && str_starts_with($message, self::MARKER_PING);
+    }
+    
+    /**
+     * Extract ping payload from marker
+     */
+    public function getPingPayload(string $message): string {
+        return substr($message, strlen(self::MARKER_PING));
     }
 }
